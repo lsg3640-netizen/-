@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Sticker Splitter</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="page">
+      <section class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow">Sticker Splitter</p>
+          <h1>한 장의 이미지에서 낱개 스티커를 자동으로 분리해 보세요</h1>
+          <p class="hero-text">
+            배경이 밝고 오브젝트가 서로 떨어져 있는 콜라주 이미지를 넣으면,
+            개별 오브젝트를 잘라내고 흰색 스티커 테두리를 붙여 PNG로 저장할 수
+            있습니다.
+          </p>
+        </div>
+        <div class="hero-panel">
+          <label class="upload-box" for="file-input">
+            <input id="file-input" type="file" accept="image/*" />
+            <span class="upload-title">이미지 업로드</span>
+            <span class="upload-desc"
+              >PNG, JPG, WEBP 파일을 드래그하거나 클릭해서 선택하세요.</span
+            >
+          </label>
+          <div class="quick-actions">
+            <button id="process-btn" class="button primary" type="button">
+              스티커 분리하기
+            </button>
+            <button id="download-all-btn" class="button secondary" type="button" disabled>
+              전체 저장
+            </button>
+          </div>
+          <p id="status" class="status">이미지를 업로드하면 준비됩니다.</p>
+        </div>
+      </section>
+
+      <section class="workspace">
+        <aside class="controls">
+          <div class="panel">
+            <div class="panel-header panel-header-compact">
+              <h2>분리 옵션</h2>
+              <span id="live-indicator" class="live-indicator">실시간 미리보기 켜짐</span>
+            </div>
+            <div class="control">
+              <label for="threshold">배경 감지 민감도</label>
+              <input id="threshold" type="range" min="8" max="72" value="28" />
+              <span id="threshold-value">28</span>
+            </div>
+            <div class="control">
+              <label for="min-area">최소 오브젝트 크기</label>
+              <input id="min-area" type="range" min="400" max="12000" step="100" value="1800" />
+              <span id="min-area-value">1800 px</span>
+            </div>
+            <div class="control">
+              <label for="padding">잘라낼 여백</label>
+              <input id="padding" type="range" min="10" max="80" value="28" />
+              <span id="padding-value">28 px</span>
+            </div>
+            <div class="control">
+              <label for="outline">스티커 테두리 두께</label>
+              <input id="outline" type="range" min="4" max="28" value="12" />
+              <span id="outline-value">12 px</span>
+            </div>
+            <div class="control checkbox">
+              <label for="transparent-bg">
+                <input id="transparent-bg" type="checkbox" checked />
+                결과를 투명 배경 PNG로 저장
+              </label>
+            </div>
+            <div class="control checkbox">
+              <label for="auto-preview">
+                <input id="auto-preview" type="checkbox" checked />
+                옵션 변경 시 자동으로 다시 분리
+              </label>
+            </div>
+          </div>
+
+          <div class="panel manual-panel">
+            <div class="panel-header panel-header-compact">
+              <h2>수동 보정</h2>
+              <span id="manual-status" class="meta">번호 박스를 클릭해 선택</span>
+            </div>
+            <p class="manual-text">
+              인식이 잘못된 번호 박스를 클릭한 뒤 박스 <strong>안쪽을 드래그하면 이동</strong>,
+              <strong>변이나 모서리를 드래그하면 크기 조절</strong>할 수 있습니다.
+            </p>
+            <div class="manual-actions">
+              <button id="undo-btn" class="button secondary" type="button" disabled>
+                되돌리기
+              </button>
+              <button id="clear-selection-btn" class="button tertiary" type="button" disabled>
+                선택 해제
+              </button>
+            </div>
+            <p id="manual-help" class="manual-help">
+              선택된 박스는 <strong>Delete</strong> 키를 누르면 삭제됩니다. 자동 재분리를 다시
+              실행하면 수동 보정은 현재 결과 기준으로 다시 계산됩니다.
+            </p>
+          </div>
+
+          <div class="panel tips">
+            <h2>잘 되는 이미지</h2>
+            <ul>
+              <li>배경이 흰색 또는 단색에 가까운 이미지</li>
+              <li>오브젝트끼리 서로 닿지 않는 콜라주</li>
+              <li>각 요소 사이에 여백이 충분한 이미지</li>
+            </ul>
+            <p>
+              밝은 오브젝트가 많은 경우에는
+              <strong>배경 감지 민감도</strong>를 낮추고 다시 분리해 보세요.
+            </p>
+          </div>
+        </aside>
+
+        <section class="stage">
+          <div class="panel preview-panel">
+            <div class="panel-header">
+              <h2>원본 미리보기</h2>
+              <span id="image-meta" class="meta">이미지 없음</span>
+            </div>
+            <div class="canvas-frame">
+              <div class="canvas-stack">
+                <canvas id="source-canvas"></canvas>
+                <canvas id="overlay-canvas"></canvas>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel results-panel">
+            <div class="panel-header">
+              <h2>분리된 스티커</h2>
+              <span id="result-count" class="meta">0개</span>
+            </div>
+            <div id="results" class="results empty">
+              <p>분리 결과가 여기 표시됩니다.</p>
+            </div>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <template id="result-card-template">
+      <article class="result-card">
+        <div class="result-preview"></div>
+        <div class="result-actions">
+          <span class="result-label"></span>
+          <button class="button tertiary erase-btn" type="button">브러시 지우기</button>
+          <button class="button tertiary delete-sticker-btn" type="button">스티커 삭제</button>
+          <button class="button tertiary download-btn" type="button">PNG 저장</button>
+        </div>
+      </article>
+    </template>
+
+    <script src="./app.js"></script>
+  </body>
+</html>
