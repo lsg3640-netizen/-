@@ -139,7 +139,7 @@ refs.processBtn.addEventListener("click", () => {
 });
 
 refs.downloadAllBtn.addEventListener("click", () => {
-  if (!state.stickers.length) {
+  if (!state.image) {
     return;
   }
 
@@ -208,6 +208,8 @@ async function processImage() {
   state.boxes = boxes;
   rebuildStickersFromBoxes(bgColor);
   state.selectedBoxIndex = -1;
+  state.addMode = false;
+  state.addDraftRect = null;
   state.boxDragState = null;
   state.panDragState = null;
   state.activeEraseIndex = -1;
@@ -698,6 +700,8 @@ function toggleAddMode() {
 
   state.addMode = !state.addMode;
   state.addDraftRect = null;
+  state.activeEraseIndex = -1;
+  state.eraseStroke = null;
 
   if (state.addMode) {
     state.selectedBoxIndex = -1;
@@ -708,6 +712,7 @@ function toggleAddMode() {
     setStatus("오브젝트 추가 모드를 종료했습니다.");
   }
 
+  renderResults();
   syncManualUi();
   drawBoxesOverlay();
 }
@@ -829,7 +834,10 @@ function addNewBox(rect) {
   state.selectedBoxIndex = state.boxes.length - 1;
   state.addMode = false;
   state.addDraftRect = null;
+  state.boxDragState = null;
+  state.panDragState = null;
   state.activeEraseIndex = -1;
+  state.eraseStroke = null;
   renderResults();
   drawBoxesOverlay();
   syncManualUi();
