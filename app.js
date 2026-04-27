@@ -4,6 +4,15 @@ const refs = {
   downloadAllBtn: document.getElementById("download-all-btn"),
   sourceCanvas: document.getElementById("source-canvas"),
   overlayCanvas: document.getElementById("overlay-canvas"),
+  canvasViewport: document.getElementById("canvas-viewport"),
+  canvasStack: document.getElementById("canvas-stack"),
+  addBoxBtn: document.getElementById("add-box-btn"),
+  addBoxHint: document.getElementById("add-box-hint"),
+  zoomInBtn: document.getElementById("zoom-in-btn"),
+  zoomOutBtn: document.getElementById("zoom-out-btn"),
+  zoomResetBtn: document.getElementById("zoom-reset-btn"),
+  zoomRange: document.getElementById("zoom-range"),
+  zoomValue: document.getElementById("zoom-value"),
   status: document.getElementById("status"),
   imageMeta: document.getElementById("image-meta"),
   resultCount: document.getElementById("result-count"),
@@ -30,52 +39,75 @@ const state = {
   image: null,
   imageName: "sticker-sheet",
   sourceImageData: null,
-  detectedComponents: [],
+  lockedThreshold: 28,
+  boxes: [],
   stickers: [],
-  isProcessing: false,
-  pendingAutoProcess: false,
-  autoProcessTimer: null,
-  selectedComponentIndex: -1,
-  dragState: null,
+  selectedBoxIndex: -1,
+  addMode: false,
+  addDraftRect: null,
+  boxDragState: null,
+  panDragState: null,
   activeEraseIndex: -1,
   eraseStroke: null,
   undoStack: [],
+  hasManualEdits: false,
+  isProcessing: false,
+  autoProcessTimer: null,
+  preview: {
+    zoom: 1,
+    minZoom: 1,
+    maxZoom: 5,
+    panX: 0,
+    panY: 0,
+    displayWidth: 0,
+    displayHeight: 0,
+    fitScale: 1,
+  },
 };
 
 const sourceCtx = refs.sourceCanvas.getContext("2d", { willReadFrequently: true });
 const overlayCtx = refs.overlayCanvas.getContext("2d");
 
-const syncRangeLabels = () => {
-  refs.thresholdValue.textContent = refs.threshold.value;
-  refs.minAreaValue.textContent = `${refs.minArea.value} px`;
-  refs.paddingValue.textContent = `${refs.padding.value} px`;
-  refs.outlineValue.textContent = `${refs.outline.value} px`;
-};
-
 syncRangeLabels();
 syncLiveIndicator();
+syncZoomUi();
 syncManualUi();
 
-[refs.threshold, refs.minArea, refs.padding, refs.outline].forEach((input) => {
-  input.addEventListener("input", () => {
-    syncRangeLabels();
-    scheduleAutoProcess();
-  });
-});
-
-refs.transparentBg.addEventListener("change", scheduleAutoProcess);
-refs.autoPreview.addEventListener("change", () => {
-  syncLiveIndicator();
-  scheduleAutoProcess();
-});
+refs.threshold.addEventListener("input", handleDetectionOptionInput);
+refs.minArea.addEventListener("input", handleDetectionOptionInput);
+refs.padding.addEventListener("input", handleRenderOptionInput);
+refs.outline.addEventListener("input", handleRenderOptionInput);
+refs.transparentBg.addEventListener("change", handleRenderOptionInput);
+refs.autoPreview.addEventListener("change", syncLiveIndicator);
 refs.undoBtn.addEventListener("click", undoLastChange);
 refs.clearSelectionBtn.addEventListener("click", clearSelection);
+refs.addBoxBtn.addEventListener("click", toggleAddMode);
+
+refs.zoomRange.addEventListener("input", (event) => {
+  setZoom(Number(event.target.value));
+});
+refs.zoomInBtn.addEventListener("click", () => {
+  setZoom(roundZoom(state.preview.zoom + 0.1));
+});
+refs.zoomOutBtn.addEventListener("click", () => {
+  setZoom(roundZoom(state.preview.zoom - 0.1));
+});
+refs.zoomResetBtn.addEventListener("click", resetZoomAndPan);
 
 refs.overlayCanvas.addEventListener("pointerdown", handleOverlayPointerDown);
 refs.overlayCanvas.addEventListener("pointermove", handleOverlayPointerMove);
 refs.overlayCanvas.addEventListener("pointerup", handleOverlayPointerUp);
 refs.overlayCanvas.addEventListener("pointerleave", handleOverlayPointerLeave);
+refs.canvasViewport.addEventListener(
+  "wheel",
+  (event) => {
+    handleViewportWheel(event);
+  },
+  { passive: false }
+);
+
 window.addEventListener("keydown", handleWindowKeydown);
+window.addEventListener("resize", refreshViewportLayout);
 
 refs.fileInput.addEventListener("change", async (event) => {
   const [file] = event.target.files || [];
@@ -87,23 +119,23 @@ refs.fileInput.addEventListener("change", async (event) => {
     const image = await loadImage(file);
     state.image = image;
     state.imageName = stripExtension(file.name) || "sticker-sheet";
+    state.lockedThreshold = Number(refs.threshold.value);
     renderSourceImage(image);
     clearResults();
-    setStatus("이미지를 불러왔습니다. 현재 옵션으로 바로 미리보기를 준비합니다.");
-    scheduleAutoProcess(true);
+    setStatus("이미지를 불러왔습니다. 옵션을 확인한 뒤 스티커 다시 분리하기를 눌러 주세요.");
   } catch (error) {
     console.error(error);
     setStatus("이미지를 불러오는 중 문제가 발생했습니다. 다른 파일로 다시 시도해 주세요.", true);
   }
 });
 
-refs.processBtn.addEventListener("click", async () => {
+refs.processBtn.addEventListener("click", () => {
   if (!state.image) {
     setStatus("먼저 이미지를 업로드해 주세요.", true);
     return;
   }
 
-  runProcess(false);
+  runProcess({ explicit: true });
 });
 
 refs.downloadAllBtn.addEventListener("click", () => {
@@ -114,113 +146,109 @@ refs.downloadAllBtn.addEventListener("click", () => {
   saveAllStickers();
 });
 
-function setStatus(message, isError = false) {
-  refs.status.textContent = message;
-  refs.status.style.color = isError ? "#9c4133" : "";
+function handleDetectionOptionInput() {
+  syncRangeLabels();
+
+  if (state.boxes.length) {
+    setStatus("배경 감지 민감도와 최소 오브젝트 크기는 스티커 다시 분리하기를 눌렀을 때만 반영됩니다.");
+  }
 }
 
-async function saveAllStickers() {
-  const filenames = state.stickers.map((_, index) => `${state.imageName}-sticker-${String(index + 1).padStart(2, "0")}.png`);
+function handleRenderOptionInput() {
+  syncRangeLabels();
 
-  refs.downloadAllBtn.disabled = true;
+  if (!state.boxes.length) {
+    return;
+  }
+
+  rebuildStickersFromBoxes();
+  renderResults();
+  drawBoxesOverlay();
+  refs.downloadAllBtn.disabled = false;
+  setStatus("현재 박스를 유지한 채 여백, 테두리, 투명 저장 옵션을 즉시 반영했습니다.");
+}
+
+async function runProcess({ explicit }) {
+  if (!state.image || state.isProcessing) {
+    return;
+  }
+
+  state.isProcessing = true;
+  refs.processBtn.disabled = true;
+  setStatus(explicit ? "이미지를 다시 분석하는 중입니다..." : "옵션 변경을 반영하는 중입니다...");
 
   try {
-    if (canPickDirectory()) {
-      setStatus("저장할 폴더를 선택해 주세요.");
-      const directoryHandle = await window.showDirectoryPicker({ mode: "readwrite" });
-      await saveStickersToDirectory(directoryHandle, filenames);
-      setStatus(`${state.stickers.length}개의 스티커를 선택한 폴더에 저장했습니다.`);
-      return;
-    }
-
-    downloadAllStickers(filenames);
-    setStatus("브라우저 제한으로 폴더 선택은 사용할 수 없어 개별 다운로드로 저장했습니다.");
+    await processImage();
   } catch (error) {
-    if (error?.name === "AbortError") {
-      setStatus("폴더 선택이 취소되었습니다.");
-      return;
-    }
-
     console.error(error);
-    downloadAllStickers(filenames);
-    setStatus("폴더 저장이 지원되지 않아 개별 다운로드로 저장했습니다.");
+    setStatus("처리 중 오류가 발생했습니다. 옵션을 조금 바꿔서 다시 시도해 주세요.", true);
   } finally {
-    refs.downloadAllBtn.disabled = !state.stickers.length;
+    state.isProcessing = false;
+    refs.processBtn.disabled = false;
   }
 }
 
-function canPickDirectory() {
-  return typeof window.showDirectoryPicker === "function";
-}
+async function processImage() {
+  const imageData = state.sourceImageData;
+  const { width, height, data } = imageData;
+  const threshold = Number(refs.threshold.value);
+  const minArea = Number(refs.minArea.value);
 
-async function saveStickersToDirectory(directoryHandle, filenames) {
-  for (const [index, sticker] of state.stickers.entries()) {
-    const fileHandle = await directoryHandle.getFileHandle(filenames[index], { create: true });
-    const writable = await fileHandle.createWritable();
-    const blob = await canvasToBlob(sticker.canvas);
-    await writable.write(blob);
-    await writable.close();
+  const bgColor = estimateBackgroundColor(data, width, height);
+  const seedMask = buildSeedMask(data, width, height, bgColor, threshold);
+  const boxes = findConnectedComponents(seedMask, width, height, minArea).sort((a, b) => a.minY - b.minY || a.minX - b.minX);
+
+  if (!boxes.length) {
+    clearResults();
+    setStatus("분리 가능한 오브젝트를 찾지 못했습니다. 배경 감지 민감도나 최소 크기를 조정해 보세요.", true);
+    return;
   }
+
+  state.lockedThreshold = threshold;
+  state.boxes = boxes;
+  rebuildStickersFromBoxes(bgColor);
+  state.selectedBoxIndex = -1;
+  state.boxDragState = null;
+  state.panDragState = null;
+  state.activeEraseIndex = -1;
+  state.eraseStroke = null;
+  state.undoStack = [];
+  state.hasManualEdits = false;
+
+  renderResults();
+  drawBoxesOverlay();
+  syncManualUi();
+  refs.downloadAllBtn.disabled = false;
+  setStatus(`${state.stickers.length}개의 스티커를 분리했습니다.`);
 }
 
-function downloadAllStickers(filenames) {
-  state.stickers.forEach((sticker, index) => {
-    setTimeout(() => {
-      downloadCanvas(sticker.canvas, filenames[index]);
-    }, index * 180);
-  });
-}
+function rebuildStickersFromBoxes(precomputedBgColor = null) {
+  if (!state.sourceImageData || !state.boxes.length) {
+    state.stickers = [];
+    return;
+  }
 
-function syncLiveIndicator() {
-  refs.liveIndicator.textContent = refs.autoPreview.checked
-    ? "실시간 미리보기 켜짐"
-    : "실시간 미리보기 꺼짐";
-}
+  const imageData = state.sourceImageData;
+  const { width, height } = imageData;
+  const bgColor = precomputedBgColor || estimateBackgroundColor(imageData.data, width, height);
+  const padding = Number(refs.padding.value);
+  const outline = Number(refs.outline.value);
+  const threshold = state.lockedThreshold ?? Number(refs.threshold.value);
 
-function syncManualUi() {
-  const hasSelection = state.selectedComponentIndex >= 0;
-  const selectedLabel = hasSelection ? `선택됨: ${state.selectedComponentIndex + 1}번` : "번호 박스를 클릭해 선택";
-
-  refs.manualStatus.textContent = selectedLabel;
-  refs.manualHelp.innerHTML = hasSelection
-    ? "박스 안쪽은 이동, 변과 모서리는 크기 조절입니다. <strong>Delete</strong> 키로 삭제할 수 있습니다."
-    : "번호 박스를 클릭해서 선택한 뒤 바로 드래그로 수정할 수 있습니다. 자동 재분리를 다시 실행하면 수동 보정은 현재 결과 기준으로 다시 계산됩니다.";
-
-  refs.undoBtn.disabled = !state.undoStack.length;
-  refs.clearSelectionBtn.disabled = !hasSelection;
-  refs.overlayCanvas.style.cursor = getCurrentCursor();
-}
-
-function stripExtension(filename) {
-  return filename.replace(/\.[^.]+$/, "");
-}
-
-function canvasToBlob(canvas) {
-  return new Promise((resolve, reject) => {
-    canvas.toBlob((blob) => {
-      if (!blob) {
-        reject(new Error("Failed to create blob from canvas"));
-        return;
-      }
-      resolve(blob);
-    }, "image/png");
-  });
-}
-
-function loadImage(file) {
-  return new Promise((resolve, reject) => {
-    const url = URL.createObjectURL(file);
-    const image = new Image();
-    image.onload = () => {
-      URL.revokeObjectURL(url);
-      resolve(image);
-    };
-    image.onerror = () => {
-      URL.revokeObjectURL(url);
-      reject(new Error("Failed to load image"));
-    };
-    image.src = url;
-  });
+  state.stickers = state.boxes.map((box, index) =>
+    createStickerFromComponent({
+      component: box,
+      width,
+      height,
+      imageData,
+      threshold,
+      padding,
+      outline,
+      bgColor,
+      name: `${state.imageName}-sticker-${index + 1}`,
+      transparentBg: refs.transparentBg.checked,
+    })
+  );
 }
 
 function renderSourceImage(image) {
@@ -233,115 +261,455 @@ function renderSourceImage(image) {
   sourceCtx.drawImage(image, 0, 0);
   state.sourceImageData = sourceCtx.getImageData(0, 0, refs.sourceCanvas.width, refs.sourceCanvas.height);
   refs.imageMeta.textContent = `${image.naturalWidth} x ${image.naturalHeight}px`;
+  resetZoomAndPan();
+  refreshViewportLayout();
 }
 
-async function processImage() {
-  const imageData = state.sourceImageData;
-  const { width, height, data } = imageData;
-  const threshold = Number(refs.threshold.value);
-  const minArea = Number(refs.minArea.value);
-  const padding = Number(refs.padding.value);
-  const outline = Number(refs.outline.value);
-
-  const bgColor = estimateBackgroundColor(data, width, height);
-  const seedMask = buildSeedMask(data, width, height, bgColor, threshold);
-  const components = findConnectedComponents(seedMask, width, height, minArea).sort(
-    (a, b) => a.minY - b.minY || a.minX - b.minX
-  );
-
-  if (!components.length) {
-    state.detectedComponents = [];
-    state.selectedComponentIndex = -1;
-    state.dragState = null;
-    drawComponentOverlay([]);
-    syncManualUi();
-    clearResults();
-    setStatus("분리 가능한 오브젝트를 찾지 못했습니다. 배경 감지 민감도나 최소 크기를 조정해 보세요.", true);
-    return;
-  }
-
-  const stickers = components.map((component, index) =>
-    createStickerFromComponent({
-      component,
-      width,
-      height,
-      imageData,
-      threshold,
-      padding,
-      outline,
-      bgColor,
-      name: `${state.imageName}-sticker-${index + 1}`,
-      transparentBg: refs.transparentBg.checked,
-    })
-  );
-
-  state.detectedComponents = components;
-  state.stickers = stickers;
-  state.selectedComponentIndex = -1;
-  state.dragState = null;
-  state.activeEraseIndex = -1;
-  state.eraseStroke = null;
-  state.undoStack = [];
-  drawComponentOverlay(components);
-  syncManualUi();
-  renderResults();
-  refs.downloadAllBtn.disabled = false;
-  setStatus(`${state.stickers.length}개의 스티커를 분리했습니다.`);
-}
-
-function scheduleAutoProcess(immediate = false) {
-  if (!state.image || !refs.autoPreview.checked) {
-    return;
-  }
-
-  if (state.autoProcessTimer) {
-    clearTimeout(state.autoProcessTimer);
-  }
-
-  const delay = immediate ? 0 : 180;
-  state.autoProcessTimer = window.setTimeout(() => {
-    state.autoProcessTimer = null;
-    runProcess(true);
-  }, delay);
-}
-
-async function runProcess(isAuto = false) {
+function refreshViewportLayout() {
   if (!state.image) {
     return;
   }
 
-  if (state.isProcessing) {
-    state.pendingAutoProcess = true;
+  const viewportWidth = refs.canvasViewport.clientWidth;
+  const viewportHeight = refs.canvasViewport.clientHeight;
+
+  if (!viewportWidth || !viewportHeight) {
     return;
   }
 
-  state.isProcessing = true;
-  refs.processBtn.disabled = true;
-  setStatus(isAuto ? "옵션 변경을 반영하는 중입니다..." : "이미지를 분석해서 개별 스티커를 분리하는 중입니다...");
+  const fitScale = Math.min(viewportWidth / state.image.naturalWidth, viewportHeight / state.image.naturalHeight, 1);
+  state.preview.fitScale = fitScale;
+  state.preview.displayWidth = Math.round(state.image.naturalWidth * fitScale);
+  state.preview.displayHeight = Math.round(state.image.naturalHeight * fitScale);
 
-  try {
-    await processImage();
-  } catch (error) {
-    console.error(error);
-    setStatus("처리 중 오류가 발생했습니다. 옵션을 조금 바꿔서 다시 시도해 주세요.", true);
-  } finally {
-    state.isProcessing = false;
-    refs.processBtn.disabled = false;
+  refs.canvasStack.style.width = `${state.preview.displayWidth}px`;
+  refs.canvasStack.style.height = `${state.preview.displayHeight}px`;
+  refs.sourceCanvas.style.width = `${state.preview.displayWidth}px`;
+  refs.sourceCanvas.style.height = `${state.preview.displayHeight}px`;
+  refs.overlayCanvas.style.width = `${state.preview.displayWidth}px`;
+  refs.overlayCanvas.style.height = `${state.preview.displayHeight}px`;
 
-    if (state.pendingAutoProcess) {
-      state.pendingAutoProcess = false;
-      scheduleAutoProcess(true);
+  applyPreviewTransform();
+  drawBoxesOverlay();
+}
+
+function resetZoomAndPan() {
+  state.preview.zoom = 1;
+  state.preview.panX = 0;
+  state.preview.panY = 0;
+  applyPreviewTransform();
+  syncZoomUi();
+}
+
+function setZoom(nextZoom, focusClientPoint = null) {
+  if (!state.image) {
+    return;
+  }
+
+  const clampedZoom = clamp(roundZoom(nextZoom), state.preview.minZoom, state.preview.maxZoom);
+  if (clampedZoom === state.preview.zoom) {
+    syncZoomUi();
+    return;
+  }
+
+  if (focusClientPoint) {
+    const imagePoint = getImagePointFromClient(focusClientPoint.clientX, focusClientPoint.clientY);
+    if (imagePoint) {
+      const viewportRect = refs.canvasViewport.getBoundingClientRect();
+      const normalizedX = imagePoint.x / refs.sourceCanvas.width - 0.5;
+      const normalizedY = imagePoint.y / refs.sourceCanvas.height - 0.5;
+      state.preview.panX =
+        focusClientPoint.clientX -
+        (viewportRect.left + viewportRect.width / 2) -
+        normalizedX * state.preview.displayWidth * clampedZoom;
+      state.preview.panY =
+        focusClientPoint.clientY -
+        (viewportRect.top + viewportRect.height / 2) -
+        normalizedY * state.preview.displayHeight * clampedZoom;
     }
+  } else if (clampedZoom === 1) {
+    state.preview.panX = 0;
+    state.preview.panY = 0;
+  }
+
+  state.preview.zoom = clampedZoom;
+  applyPreviewTransform();
+  syncZoomUi();
+}
+
+function applyPreviewTransform() {
+  const clampedPan = clampPan(state.preview.panX, state.preview.panY, state.preview.zoom);
+  state.preview.panX = clampedPan.x;
+  state.preview.panY = clampedPan.y;
+  refs.canvasStack.style.transform = `translate(-50%, -50%) translate(${state.preview.panX}px, ${state.preview.panY}px) scale(${state.preview.zoom})`;
+  syncZoomUi();
+}
+
+function clampPan(panX, panY, zoom) {
+  const viewportWidth = refs.canvasViewport.clientWidth;
+  const viewportHeight = refs.canvasViewport.clientHeight;
+  const slack = 80;
+  const limitX = Math.max(0, (state.preview.displayWidth * zoom - viewportWidth) / 2) + slack;
+  const limitY = Math.max(0, (state.preview.displayHeight * zoom - viewportHeight) / 2) + slack;
+
+  return {
+    x: clamp(panX, -limitX, limitX),
+    y: clamp(panY, -limitY, limitY),
+  };
+}
+
+function handleViewportWheel(event) {
+  if (!state.image) {
+    return;
+  }
+
+  event.preventDefault();
+  const delta = event.deltaY < 0 ? 0.12 : -0.12;
+  setZoom(state.preview.zoom + delta, { clientX: event.clientX, clientY: event.clientY });
+}
+
+function syncRangeLabels() {
+  refs.thresholdValue.textContent = refs.threshold.value;
+  refs.minAreaValue.textContent = `${refs.minArea.value} px`;
+  refs.paddingValue.textContent = `${refs.padding.value} px`;
+  refs.outlineValue.textContent = `${refs.outline.value} px`;
+}
+
+function syncLiveIndicator() {
+  refs.liveIndicator.textContent = refs.autoPreview.checked ? "실시간 미리보기 켜짐" : "실시간 미리보기 꺼짐";
+}
+
+function syncZoomUi() {
+  const percentage = `${Math.round(state.preview.zoom * 100)}%`;
+  refs.zoomRange.value = state.preview.zoom.toFixed(1);
+  refs.zoomValue.textContent = percentage;
+  refs.zoomResetBtn.textContent = percentage;
+}
+
+function syncManualUi() {
+  const hasSelection = state.selectedBoxIndex >= 0;
+  const selectedLabel = hasSelection ? `선택됨: ${state.selectedBoxIndex + 1}번` : "번호 박스를 클릭해 선택";
+
+  refs.manualStatus.textContent = selectedLabel;
+  refs.manualHelp.innerHTML = hasSelection
+    ? "박스 안쪽은 이동, 변과 모서리는 크기 조절입니다. <strong>Delete</strong> 키로 삭제할 수 있습니다."
+    : "번호 박스를 클릭해서 선택한 뒤 바로 드래그로 수정할 수 있습니다. 여백, 테두리, 투명 저장은 즉시 반영되고 감지 옵션은 스티커 다시 분리하기를 눌렀을 때만 반영됩니다.";
+
+  refs.undoBtn.disabled = !state.undoStack.length;
+  refs.clearSelectionBtn.disabled = !hasSelection;
+  refs.addBoxBtn.textContent = state.addMode ? "추가 중…" : "오브젝트 추가";
+  refs.addBoxBtn.classList.toggle("mode-active", state.addMode);
+  refs.addBoxHint.hidden = !state.addMode;
+
+  refs.overlayCanvas.style.cursor = getOverlayCursor();
+}
+
+function getOverlayCursor() {
+  if (state.addMode) {
+    return "crosshair";
+  }
+
+  if (state.boxDragState) {
+    return getCursorForHandle(state.boxDragState.handle);
+  }
+
+  if (state.panDragState) {
+    return "grabbing";
+  }
+
+  return state.image ? "grab" : "default";
+}
+
+function handleOverlayPointerDown(event) {
+  if (!state.image) {
+    return;
+  }
+
+  const point = getCanvasPoint(event);
+  if (!point) {
+    return;
+  }
+
+  if (state.addMode) {
+    state.addDraftRect = {
+      startX: point.x,
+      startY: point.y,
+      endX: point.x,
+      endY: point.y,
+    };
+    refs.overlayCanvas.setPointerCapture(event.pointerId);
+    drawBoxesOverlay();
+    return;
+  }
+
+  const selectedRect = getSelectedBoxRect();
+  const selectedHandle = selectedRect ? getHandleAtPoint(selectedRect, point.x, point.y) : null;
+
+  if (selectedRect && selectedHandle) {
+    beginBoxDrag(event, selectedHandle, selectedRect, point);
+    return;
+  }
+
+  const hitIndex = findBoxIndexAtPoint(point.x, point.y);
+  if (hitIndex >= 0) {
+    state.selectedBoxIndex = hitIndex;
+    const rect = getSelectedBoxRect();
+    const handle = getHandleAtPoint(rect, point.x, point.y) || "move";
+    beginBoxDrag(event, handle, rect, point);
+    syncManualUi();
+    drawBoxesOverlay();
+    return;
+  }
+
+  state.selectedBoxIndex = -1;
+  state.boxDragState = null;
+  state.panDragState = {
+    pointerId: event.pointerId,
+    startClientX: event.clientX,
+    startClientY: event.clientY,
+    startPanX: state.preview.panX,
+    startPanY: state.preview.panY,
+  };
+  refs.overlayCanvas.setPointerCapture(event.pointerId);
+  syncManualUi();
+  drawBoxesOverlay();
+}
+
+function beginBoxDrag(event, handle, rect, point) {
+  state.boxDragState = {
+    pointerId: event.pointerId,
+    handle,
+    startPoint: point,
+    startRect: { ...rect },
+    previewRect: { ...rect },
+  };
+  state.panDragState = null;
+  refs.overlayCanvas.setPointerCapture(event.pointerId);
+  refs.overlayCanvas.style.cursor = getCursorForHandle(handle);
+}
+
+function handleOverlayPointerMove(event) {
+  if (!state.image) {
+    return;
+  }
+
+  if (state.addMode && state.addDraftRect) {
+    const point = getCanvasPoint(event);
+    if (!point) {
+      return;
+    }
+
+    state.addDraftRect = {
+      startX: state.addDraftRect.startX,
+      startY: state.addDraftRect.startY,
+      endX: point.x,
+      endY: point.y,
+    };
+    drawBoxesOverlay();
+    return;
+  }
+
+  if (state.boxDragState && state.boxDragState.pointerId === event.pointerId) {
+    const point = getCanvasPoint(event);
+    if (!point) {
+      return;
+    }
+
+    state.boxDragState.previewRect = getDraggedRect(
+      state.boxDragState,
+      point,
+      refs.sourceCanvas.width,
+      refs.sourceCanvas.height
+    );
+    drawBoxesOverlay();
+    return;
+  }
+
+  if (state.panDragState && state.panDragState.pointerId === event.pointerId) {
+    const dx = event.clientX - state.panDragState.startClientX;
+    const dy = event.clientY - state.panDragState.startClientY;
+    state.preview.panX = state.panDragState.startPanX + dx;
+    state.preview.panY = state.panDragState.startPanY + dy;
+    applyPreviewTransform();
+    return;
+  }
+
+  const point = getCanvasPoint(event);
+  if (!point) {
+    refs.overlayCanvas.style.cursor = getOverlayCursor();
+    return;
+  }
+
+  const selectedRect = getSelectedBoxRect();
+  const handle = selectedRect ? getHandleAtPoint(selectedRect, point.x, point.y) : null;
+  refs.overlayCanvas.style.cursor = handle ? getCursorForHandle(handle) : "grab";
+}
+
+function handleOverlayPointerUp(event) {
+  if (state.addMode && state.addDraftRect) {
+    const point = getCanvasPoint(event) || {
+      x: state.addDraftRect.endX,
+      y: state.addDraftRect.endY,
+    };
+
+    state.addDraftRect = {
+      startX: state.addDraftRect.startX,
+      startY: state.addDraftRect.startY,
+      endX: point.x,
+      endY: point.y,
+    };
+
+    if (refs.overlayCanvas.hasPointerCapture(event.pointerId)) {
+      refs.overlayCanvas.releasePointerCapture(event.pointerId);
+    }
+
+    const rect = normalizeRect(state.addDraftRect);
+    state.addDraftRect = null;
+
+    if (rect.width < 12 || rect.height < 12) {
+      drawBoxesOverlay();
+      setStatus("새 오브젝트 박스가 너무 작습니다. 조금 더 크게 드래그해 주세요.", true);
+      return;
+    }
+
+    pushUndoState();
+    state.hasManualEdits = true;
+    addNewBox(rect);
+    return;
+  }
+
+  if (state.boxDragState && state.boxDragState.pointerId === event.pointerId) {
+    const point = getCanvasPoint(event) || state.boxDragState.startPoint;
+    const finalRect = getDraggedRect(
+      state.boxDragState,
+      point,
+      refs.sourceCanvas.width,
+      refs.sourceCanvas.height
+    );
+
+    if (refs.overlayCanvas.hasPointerCapture(event.pointerId)) {
+      refs.overlayCanvas.releasePointerCapture(event.pointerId);
+    }
+
+    const changed =
+      finalRect.minX !== state.boxDragState.startRect.minX ||
+      finalRect.minY !== state.boxDragState.startRect.minY ||
+      finalRect.maxX !== state.boxDragState.startRect.maxX ||
+      finalRect.maxY !== state.boxDragState.startRect.maxY;
+
+    state.boxDragState = null;
+
+    if (!changed) {
+      drawBoxesOverlay();
+      syncManualUi();
+      return;
+    }
+
+    pushUndoState();
+    state.hasManualEdits = true;
+    applyManualReplacement(finalRect);
+    return;
+  }
+
+  if (state.panDragState && state.panDragState.pointerId === event.pointerId) {
+    if (refs.overlayCanvas.hasPointerCapture(event.pointerId)) {
+      refs.overlayCanvas.releasePointerCapture(event.pointerId);
+    }
+    state.panDragState = null;
+    refs.overlayCanvas.style.cursor = getOverlayCursor();
   }
 }
 
+function handleOverlayPointerLeave(event) {
+  if (
+    (state.boxDragState && state.boxDragState.pointerId === event.pointerId) ||
+    (state.panDragState && state.panDragState.pointerId === event.pointerId)
+  ) {
+    return;
+  }
+
+  refs.overlayCanvas.style.cursor = getOverlayCursor();
+}
+
+function handleWindowKeydown(event) {
+  const activeTag = document.activeElement?.tagName;
+  const isTyping = activeTag === "INPUT" || activeTag === "TEXTAREA" || document.activeElement?.isContentEditable;
+  const isUndoKey = (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z";
+
+  if (event.key === "Escape" && state.addMode) {
+    event.preventDefault();
+    state.addMode = false;
+    state.addDraftRect = null;
+    syncManualUi();
+    drawBoxesOverlay();
+    setStatus("오브젝트 추가 모드를 종료했습니다.");
+    return;
+  }
+
+  if (isUndoKey) {
+    event.preventDefault();
+    undoLastChange();
+    return;
+  }
+
+  if (isTyping || state.selectedBoxIndex < 0) {
+    return;
+  }
+
+  if (event.key === "Delete" || event.key === "Backspace") {
+    event.preventDefault();
+    deleteSelectedBox();
+  }
+}
+
+function getCanvasPoint(event) {
+  return getImagePointFromClient(event.clientX, event.clientY);
+}
+
+function getImagePointFromClient(clientX, clientY) {
+  const rect = refs.overlayCanvas.getBoundingClientRect();
+  if (!rect.width || !rect.height) {
+    return null;
+  }
+
+  const normalizedX = (clientX - rect.left) / rect.width;
+  const normalizedY = (clientY - rect.top) / rect.height;
+
+  return {
+    x: clamp(Math.round(normalizedX * refs.overlayCanvas.width), 0, refs.overlayCanvas.width - 1),
+    y: clamp(Math.round(normalizedY * refs.overlayCanvas.height), 0, refs.overlayCanvas.height - 1),
+  };
+}
+
 function clearSelection() {
-  state.selectedComponentIndex = -1;
-  state.dragState = null;
+  state.selectedBoxIndex = -1;
+  state.boxDragState = null;
   state.activeEraseIndex = -1;
   syncManualUi();
-  drawComponentOverlay(state.detectedComponents);
+  drawBoxesOverlay();
   renderResults();
+}
+
+function toggleAddMode() {
+  if (!state.image) {
+    setStatus("먼저 이미지를 업로드해 주세요.", true);
+    return;
+  }
+
+  state.addMode = !state.addMode;
+  state.addDraftRect = null;
+
+  if (state.addMode) {
+    state.selectedBoxIndex = -1;
+    state.boxDragState = null;
+    state.panDragState = null;
+    setStatus("드래그해서 새 오브젝트 영역을 지정하세요.");
+  } else {
+    setStatus("오브젝트 추가 모드를 종료했습니다.");
+  }
+
+  syncManualUi();
+  drawBoxesOverlay();
 }
 
 function pushUndoState() {
@@ -350,9 +718,10 @@ function pushUndoState() {
   }
 
   state.undoStack.push({
-    detectedComponents: state.detectedComponents.map(cloneComponent),
+    lockedThreshold: state.lockedThreshold,
+    boxes: state.boxes.map(cloneBox),
     stickers: state.stickers.map(serializeSticker),
-    selectedComponentIndex: state.selectedComponentIndex,
+    selectedBoxIndex: state.selectedBoxIndex,
   });
 
   if (state.undoStack.length > 20) {
@@ -368,268 +737,55 @@ async function undoLastChange() {
   }
 
   const snapshot = state.undoStack.pop();
-  state.detectedComponents = snapshot.detectedComponents.map(cloneComponent);
+  state.lockedThreshold = snapshot.lockedThreshold ?? state.lockedThreshold;
+  state.boxes = snapshot.boxes.map(cloneBox);
   state.stickers = await Promise.all(snapshot.stickers.map(deserializeSticker));
-  state.selectedComponentIndex = Math.min(snapshot.selectedComponentIndex, state.detectedComponents.length - 1);
-  state.dragState = null;
+  state.selectedBoxIndex = Math.min(snapshot.selectedBoxIndex, state.boxes.length - 1);
+  state.addMode = false;
+  state.addDraftRect = null;
+  state.boxDragState = null;
+  state.panDragState = null;
   state.activeEraseIndex = -1;
   state.eraseStroke = null;
+  state.hasManualEdits = true;
 
   renderResults();
-  drawComponentOverlay(state.detectedComponents);
+  drawBoxesOverlay();
   syncManualUi();
   refs.downloadAllBtn.disabled = !state.stickers.length;
   refs.resultCount.textContent = `${state.stickers.length}개`;
   setStatus("방금 작업을 되돌렸습니다.");
 }
 
-function handleOverlayPointerDown(event) {
-  if (!state.image) {
+function deleteSelectedBox() {
+  if (state.selectedBoxIndex < 0) {
     return;
   }
 
-  const point = getCanvasPoint(event);
-  if (!point) {
-    return;
-  }
-
-  const selectedRect = getSelectedComponentRect();
-  const selectedHandle = selectedRect ? getHandleAtPoint(selectedRect, point.x, point.y) : null;
-
-  if (selectedRect && selectedHandle) {
-    state.dragState = {
-      pointerId: event.pointerId,
-      handle: selectedHandle,
-      startPoint: point,
-      startRect: { ...selectedRect },
-      previewRect: { ...selectedRect },
-    };
-    refs.overlayCanvas.setPointerCapture(event.pointerId);
-    refs.overlayCanvas.style.cursor = getCursorForHandle(selectedHandle);
-    return;
-  }
-
-  const index = findComponentIndexAtPoint(point.x, point.y);
-  state.selectedComponentIndex = index;
-  state.dragState = null;
-  syncManualUi();
-  drawComponentOverlay(state.detectedComponents);
-
-  if (index >= 0) {
-    setStatus(`${index + 1}번 박스를 선택했습니다. 드래그해서 위치나 크기를 수정할 수 있습니다.`);
-  }
+  deleteStickerByIndex(state.selectedBoxIndex);
 }
 
-function handleOverlayPointerMove(event) {
-  if (state.dragState && state.dragState.pointerId === event.pointerId) {
-    const point = getCanvasPoint(event);
-    if (!point) {
-      return;
-    }
-
-    state.dragState.previewRect = getDraggedRect(state.dragState, point, refs.overlayCanvas.width, refs.overlayCanvas.height);
-    drawComponentOverlay(state.detectedComponents);
-    return;
-  }
-
-  const point = getCanvasPoint(event);
-  if (!point) {
-    return;
-  }
-
-  const selectedRect = getSelectedComponentRect();
-  const handle = selectedRect ? getHandleAtPoint(selectedRect, point.x, point.y) : null;
-  refs.overlayCanvas.style.cursor = handle ? getCursorForHandle(handle) : "pointer";
-}
-
-function handleOverlayPointerUp(event) {
-  if (!state.dragState || state.dragState.pointerId !== event.pointerId) {
-    return;
-  }
-
-  const point = getCanvasPoint(event) || state.dragState.startPoint;
-  const finalRect = getDraggedRect(state.dragState, point, refs.overlayCanvas.width, refs.overlayCanvas.height);
-
-  if (refs.overlayCanvas.hasPointerCapture(event.pointerId)) {
-    refs.overlayCanvas.releasePointerCapture(event.pointerId);
-  }
-
-  const changed =
-    finalRect.minX !== state.dragState.startRect.minX ||
-    finalRect.minY !== state.dragState.startRect.minY ||
-    finalRect.maxX !== state.dragState.startRect.maxX ||
-    finalRect.maxY !== state.dragState.startRect.maxY;
-
-  state.dragState = null;
-
-  if (!changed) {
-    drawComponentOverlay(state.detectedComponents);
-    return;
-  }
-
-  pushUndoState();
-  applyManualReplacement(finalRect);
-}
-
-function handleOverlayPointerLeave(event) {
-  if (state.dragState && state.dragState.pointerId === event.pointerId) {
-    return;
-  }
-
-  refs.overlayCanvas.style.cursor = getCurrentCursor();
-}
-
-function handleWindowKeydown(event) {
-  const isUndoKey = (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z";
-  const activeTag = document.activeElement?.tagName;
-  const isTyping = activeTag === "INPUT" || activeTag === "TEXTAREA" || document.activeElement?.isContentEditable;
-
-  if (isUndoKey) {
-    event.preventDefault();
-    undoLastChange();
-    return;
-  }
-
-  if (isTyping || state.selectedComponentIndex < 0) {
-    return;
-  }
-
-  if (event.key !== "Delete" && event.key !== "Backspace") {
-    return;
-  }
-
-  event.preventDefault();
-  deleteSelectedComponent();
-}
-
-function toggleEraseMode(index) {
-  state.activeEraseIndex = state.activeEraseIndex === index ? -1 : index;
-  state.eraseStroke = null;
-  renderResults();
-
-  if (state.activeEraseIndex === index) {
-    setStatus(`${index + 1}번 스티커에서 부분 지우기 모드가 켜졌습니다. 드래그해서 지워 보세요.`);
-  }
-}
-
-function deleteStickerByIndex(index) {
-  if (index < 0 || index >= state.stickers.length) {
-    return;
-  }
-
-  pushUndoState();
-
-  state.stickers.splice(index, 1);
-  state.detectedComponents.splice(index, 1);
-
-  if (!state.stickers.length) {
-    clearResults(false);
-    setStatus("스티커를 삭제했습니다. 남은 스티커가 없습니다.");
-    return;
-  }
-
-  if (state.selectedComponentIndex === index) {
-    state.selectedComponentIndex = -1;
-  } else if (state.selectedComponentIndex > index) {
-    state.selectedComponentIndex -= 1;
-  }
-
-  if (state.activeEraseIndex === index) {
-    state.activeEraseIndex = -1;
-  } else if (state.activeEraseIndex > index) {
-    state.activeEraseIndex -= 1;
-  }
-
-  state.dragState = null;
-  state.eraseStroke = null;
-  renderResults();
-  drawComponentOverlay(state.detectedComponents);
-  syncManualUi();
-  refs.downloadAllBtn.disabled = !state.stickers.length;
-  refs.resultCount.textContent = `${state.stickers.length}개`;
-  setStatus(`${index + 1}번 스티커를 삭제했습니다.`);
-}
-
-function clearResults(resetUndo = true) {
-  state.detectedComponents = [];
-  state.stickers = [];
-  state.selectedComponentIndex = -1;
-  state.dragState = null;
-  state.activeEraseIndex = -1;
-  state.eraseStroke = null;
-  if (resetUndo) {
-    state.undoStack = [];
-  }
-  refs.results.innerHTML = "<p>분리 결과가 여기 표시됩니다.</p>";
-  refs.results.classList.add("empty");
-  refs.resultCount.textContent = "0개";
-  refs.downloadAllBtn.disabled = true;
-  overlayCtx.clearRect(0, 0, refs.overlayCanvas.width, refs.overlayCanvas.height);
-  syncManualUi();
-}
-
-function renderResults() {
-  refs.results.innerHTML = "";
-  refs.results.classList.remove("empty");
-  refs.resultCount.textContent = `${state.stickers.length}개`;
-
-  state.stickers.forEach((sticker, index) => {
-    const fragment = refs.template.content.cloneNode(true);
-    const card = fragment.querySelector(".result-card");
-    const preview = fragment.querySelector(".result-preview");
-    const label = fragment.querySelector(".result-label");
-    const eraseButton = fragment.querySelector(".erase-btn");
-    const deleteButton = fragment.querySelector(".delete-sticker-btn");
-    const button = fragment.querySelector(".download-btn");
-
-    sticker.canvas.classList.toggle("erase-mode", state.activeEraseIndex === index);
-    sticker.canvas.onpointerdown = (event) => handleStickerErasePointerDown(event, index);
-    sticker.canvas.onpointermove = (event) => handleStickerErasePointerMove(event, index);
-    sticker.canvas.onpointerup = (event) => handleStickerErasePointerUp(event, index);
-    sticker.canvas.onpointerleave = (event) => handleStickerErasePointerLeave(event, index);
-
-    preview.appendChild(sticker.canvas);
-    label.textContent = `스티커 ${index + 1}`;
-    eraseButton.textContent = state.activeEraseIndex === index ? "브러시 종료" : "브러시 지우기";
-    eraseButton.classList.toggle("erase-active", state.activeEraseIndex === index);
-    eraseButton.addEventListener("click", () => toggleEraseMode(index));
-    deleteButton.addEventListener("click", () => deleteStickerByIndex(index));
-    button.addEventListener("click", () => {
-      downloadCanvas(sticker.canvas, `${state.imageName}-sticker-${String(index + 1).padStart(2, "0")}.png`);
-    });
-
-    refs.results.appendChild(card);
-  });
-}
-
-function drawComponentOverlay(components) {
+function drawBoxesOverlay() {
   overlayCtx.clearRect(0, 0, refs.overlayCanvas.width, refs.overlayCanvas.height);
 
   overlayCtx.save();
   overlayCtx.font = `${Math.max(14, Math.round(refs.sourceCanvas.width * 0.015))}px "Segoe UI", sans-serif`;
   overlayCtx.textBaseline = "top";
 
-  components.forEach((component, index) => {
-    const currentRect =
-      index === state.selectedComponentIndex && state.dragState?.previewRect
-        ? state.dragState.previewRect
-        : {
-            minX: component.minX,
-            minY: component.minY,
-            maxX: component.maxX,
-            maxY: component.maxY,
-            width: component.maxX - component.minX + 1,
-            height: component.maxY - component.minY + 1,
-          };
-    const isSelected = index === state.selectedComponentIndex;
+  state.boxes.forEach((box, index) => {
+    const rect =
+      index === state.selectedBoxIndex && state.boxDragState?.previewRect
+        ? state.boxDragState.previewRect
+        : boxToRect(box);
+    const isSelected = index === state.selectedBoxIndex;
     const fillColor = isSelected ? "rgba(160, 115, 88, 0.18)" : "rgba(183, 134, 111, 0.10)";
     const strokeColor = isSelected ? "rgba(118, 72, 46, 0.95)" : "rgba(142, 94, 71, 0.75)";
 
     overlayCtx.fillStyle = fillColor;
     overlayCtx.strokeStyle = strokeColor;
     overlayCtx.lineWidth = isSelected ? Math.max(3, refs.sourceCanvas.width * 0.0036) : Math.max(2, refs.sourceCanvas.width * 0.0025);
-    overlayCtx.fillRect(currentRect.minX, currentRect.minY, currentRect.width, currentRect.height);
-    overlayCtx.strokeRect(currentRect.minX, currentRect.minY, currentRect.width, currentRect.height);
+    overlayCtx.fillRect(rect.minX, rect.minY, rect.width, rect.height);
+    overlayCtx.strokeRect(rect.minX, rect.minY, rect.width, rect.height);
 
     const label = `${index + 1}`;
     const paddingX = 10;
@@ -637,8 +793,8 @@ function drawComponentOverlay(components) {
     const textWidth = overlayCtx.measureText(label).width;
     const labelWidth = textWidth + paddingX * 2;
     const labelHeight = parseInt(overlayCtx.font, 10) + paddingY * 2;
-    const labelX = currentRect.minX;
-    const labelY = Math.max(0, currentRect.minY - labelHeight - 4);
+    const labelX = rect.minX;
+    const labelY = Math.max(0, rect.minY - labelHeight - 4);
 
     overlayCtx.fillStyle = isSelected ? "rgba(118, 72, 46, 0.96)" : "rgba(142, 94, 71, 0.92)";
     roundRect(overlayCtx, labelX, labelY, labelWidth, labelHeight, 10);
@@ -648,46 +804,57 @@ function drawComponentOverlay(components) {
     overlayCtx.fillText(label, labelX + paddingX, labelY + paddingY);
 
     if (isSelected) {
-      drawSelectionHandles(currentRect);
+      drawSelectionHandles(rect);
     }
   });
+
+  if (state.addDraftRect) {
+    const rect = normalizeRect(state.addDraftRect);
+    overlayCtx.setLineDash([12, 8]);
+    overlayCtx.strokeStyle = "rgba(36, 127, 121, 0.98)";
+    overlayCtx.fillStyle = "rgba(71, 174, 167, 0.14)";
+    overlayCtx.lineWidth = Math.max(3, refs.sourceCanvas.width * 0.0032);
+    overlayCtx.fillRect(rect.minX, rect.minY, rect.width, rect.height);
+    overlayCtx.strokeRect(rect.minX, rect.minY, rect.width, rect.height);
+    overlayCtx.setLineDash([]);
+  }
 
   overlayCtx.restore();
 }
 
-function getCanvasPoint(event) {
-  const rect = refs.overlayCanvas.getBoundingClientRect();
-  if (!rect.width || !rect.height) {
-    return null;
-  }
+function addNewBox(rect) {
+  const newBox = buildManualBoxFromRect(rect, state.sourceImageData.width);
+  state.boxes.push(newBox);
+  rebuildStickersFromBoxes();
+  state.selectedBoxIndex = state.boxes.length - 1;
+  state.addMode = false;
+  state.addDraftRect = null;
+  state.activeEraseIndex = -1;
+  renderResults();
+  drawBoxesOverlay();
+  syncManualUi();
+  refs.downloadAllBtn.disabled = false;
+  setStatus(`${state.selectedBoxIndex + 1}번 오브젝트 박스를 추가했습니다.`);
+}
 
-  const scaleX = refs.overlayCanvas.width / rect.width;
-  const scaleY = refs.overlayCanvas.height / rect.height;
-
+function boxToRect(box) {
   return {
-    x: clamp(Math.round((event.clientX - rect.left) * scaleX), 0, refs.overlayCanvas.width - 1),
-    y: clamp(Math.round((event.clientY - rect.top) * scaleY), 0, refs.overlayCanvas.height - 1),
+    minX: box.minX,
+    minY: box.minY,
+    maxX: box.maxX,
+    maxY: box.maxY,
+    width: box.maxX - box.minX + 1,
+    height: box.maxY - box.minY + 1,
   };
 }
 
-function getSelectedComponentRect() {
-  if (state.selectedComponentIndex < 0) {
+function getSelectedBoxRect() {
+  if (state.selectedBoxIndex < 0) {
     return null;
   }
 
-  const component = state.detectedComponents[state.selectedComponentIndex];
-  if (!component) {
-    return null;
-  }
-
-  return {
-    minX: component.minX,
-    minY: component.minY,
-    maxX: component.maxX,
-    maxY: component.maxY,
-    width: component.maxX - component.minX + 1,
-    height: component.maxY - component.minY + 1,
-  };
+  const box = state.boxes[state.selectedBoxIndex];
+  return box ? boxToRect(box) : null;
 }
 
 function getHandleAtPoint(rect, x, y) {
@@ -762,168 +929,18 @@ function getCursorForHandle(handle) {
     se: "nwse-resize",
   };
 
-  return cursorMap[handle] || "pointer";
+  return cursorMap[handle] || "grab";
 }
 
-function getCurrentCursor() {
-  if (state.dragState?.handle) {
-    return getCursorForHandle(state.dragState.handle);
-  }
-
-  return "pointer";
-}
-
-function findComponentIndexAtPoint(x, y) {
-  for (let index = state.detectedComponents.length - 1; index >= 0; index -= 1) {
-    const component = state.detectedComponents[index];
-    if (x >= component.minX && x <= component.maxX && y >= component.minY && y <= component.maxY) {
+function findBoxIndexAtPoint(x, y) {
+  for (let index = state.boxes.length - 1; index >= 0; index -= 1) {
+    const box = state.boxes[index];
+    if (x >= box.minX && x <= box.maxX && y >= box.minY && y <= box.maxY) {
       return index;
     }
   }
 
   return -1;
-}
-
-function applyManualReplacement(rect) {
-  if (state.selectedComponentIndex < 0 || !state.sourceImageData) {
-    return;
-  }
-
-  const manualComponent = buildManualComponentFromRect(rect, state.sourceImageData.width);
-  const threshold = Number(refs.threshold.value);
-  const padding = Number(refs.padding.value);
-  const outline = Number(refs.outline.value);
-  const bgColor = estimateBackgroundColor(
-    state.sourceImageData.data,
-    state.sourceImageData.width,
-    state.sourceImageData.height
-  );
-
-  const sticker = createStickerFromComponent({
-    component: manualComponent,
-    width: state.sourceImageData.width,
-    height: state.sourceImageData.height,
-    imageData: state.sourceImageData,
-    threshold,
-    padding,
-    outline,
-    bgColor,
-    name: `${state.imageName}-sticker-${state.selectedComponentIndex + 1}`,
-    transparentBg: refs.transparentBg.checked,
-  });
-
-  state.detectedComponents[state.selectedComponentIndex] = manualComponent;
-  state.stickers[state.selectedComponentIndex] = sticker;
-  syncManualUi();
-  drawComponentOverlay(state.detectedComponents);
-  renderResults();
-  setStatus(`${state.selectedComponentIndex + 1}번 스티커를 드래그 기준으로 수정했습니다.`);
-}
-
-function buildManualComponentFromRect(rect, imageWidth) {
-  const pixels = [];
-
-  for (let y = rect.minY; y <= rect.maxY; y += 1) {
-    for (let x = rect.minX; x <= rect.maxX; x += 1) {
-      pixels.push(y * imageWidth + x);
-    }
-  }
-
-  return {
-    pixels,
-    minX: rect.minX,
-    minY: rect.minY,
-    maxX: rect.maxX,
-    maxY: rect.maxY,
-    area: pixels.length,
-    manual: true,
-  };
-}
-
-function handleStickerErasePointerDown(event, index) {
-  if (state.activeEraseIndex !== index) {
-    return;
-  }
-
-  const point = getStickerCanvasPoint(state.stickers[index].canvas, event);
-  if (!point) {
-    return;
-  }
-
-  pushUndoState();
-  state.eraseStroke = {
-    index,
-    pointerId: event.pointerId,
-    radius: getEraseRadius(state.stickers[index].canvas),
-  };
-
-  state.stickers[index].canvas.setPointerCapture(event.pointerId);
-  eraseOnStickerCanvas(state.stickers[index].canvas, point, state.eraseStroke.radius);
-  event.preventDefault();
-}
-
-function handleStickerErasePointerMove(event, index) {
-  if (!state.eraseStroke || state.eraseStroke.index !== index || state.eraseStroke.pointerId !== event.pointerId) {
-    return;
-  }
-
-  const point = getStickerCanvasPoint(state.stickers[index].canvas, event);
-  if (!point) {
-    return;
-  }
-
-  eraseOnStickerCanvas(state.stickers[index].canvas, point, state.eraseStroke.radius);
-  event.preventDefault();
-}
-
-function handleStickerErasePointerUp(event, index) {
-  if (!state.eraseStroke || state.eraseStroke.index !== index || state.eraseStroke.pointerId !== event.pointerId) {
-    return;
-  }
-
-  if (state.stickers[index].canvas.hasPointerCapture(event.pointerId)) {
-    state.stickers[index].canvas.releasePointerCapture(event.pointerId);
-  }
-
-  state.eraseStroke = null;
-  setStatus(`${index + 1}번 스티커에서 일부를 지웠습니다. 되돌리기로 복원할 수 있습니다.`);
-}
-
-function handleStickerErasePointerLeave(event, index) {
-  if (!state.eraseStroke || state.eraseStroke.index !== index || state.eraseStroke.pointerId !== event.pointerId) {
-    return;
-  }
-
-  handleStickerErasePointerUp(event, index);
-}
-
-function getStickerCanvasPoint(canvas, event) {
-  const rect = canvas.getBoundingClientRect();
-  if (!rect.width || !rect.height) {
-    return null;
-  }
-
-  const scaleX = canvas.width / rect.width;
-  const scaleY = canvas.height / rect.height;
-
-  return {
-    x: clamp((event.clientX - rect.left) * scaleX, 0, canvas.width),
-    y: clamp((event.clientY - rect.top) * scaleY, 0, canvas.height),
-  };
-}
-
-function getEraseRadius(canvas) {
-  return Math.max(10, Math.round(Math.min(canvas.width, canvas.height) * 0.06));
-}
-
-function eraseOnStickerCanvas(canvas, point, radius) {
-  const ctx = canvas.getContext("2d");
-  ctx.save();
-  ctx.globalCompositeOperation = "destination-out";
-  ctx.beginPath();
-  ctx.arc(point.x, point.y, radius, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.restore();
 }
 
 function getDraggedRect(dragState, point, maxWidth, maxHeight) {
@@ -990,35 +1007,324 @@ function translateRect(rect, dx, dy, maxWidth, maxHeight) {
   };
 }
 
-function deleteSelectedComponent() {
-  if (state.selectedComponentIndex < 0) {
+function applyManualReplacement(rect) {
+  if (state.selectedBoxIndex < 0 || !state.sourceImageData) {
+    return;
+  }
+
+  const manualBox = buildManualBoxFromRect(rect, state.sourceImageData.width);
+  const padding = Number(refs.padding.value);
+  const outline = Number(refs.outline.value);
+  const bgColor = estimateBackgroundColor(
+    state.sourceImageData.data,
+    state.sourceImageData.width,
+    state.sourceImageData.height
+  );
+
+  const sticker = createStickerFromComponent({
+      component: manualBox,
+      width: state.sourceImageData.width,
+      height: state.sourceImageData.height,
+      imageData: state.sourceImageData,
+      threshold: state.lockedThreshold,
+      padding,
+      outline,
+      bgColor,
+    name: `${state.imageName}-sticker-${state.selectedBoxIndex + 1}`,
+    transparentBg: refs.transparentBg.checked,
+  });
+
+  state.boxes[state.selectedBoxIndex] = manualBox;
+  state.stickers[state.selectedBoxIndex] = sticker;
+  drawBoxesOverlay();
+  renderResults();
+  syncManualUi();
+  setStatus(`${state.selectedBoxIndex + 1}번 스티커를 드래그 기준으로 수정했습니다.`);
+}
+
+function buildManualBoxFromRect(rect, imageWidth) {
+  const pixels = [];
+
+  for (let y = rect.minY; y <= rect.maxY; y += 1) {
+    for (let x = rect.minX; x <= rect.maxX; x += 1) {
+      pixels.push(y * imageWidth + x);
+    }
+  }
+
+  return {
+    pixels,
+    minX: rect.minX,
+    minY: rect.minY,
+    maxX: rect.maxX,
+    maxY: rect.maxY,
+    area: pixels.length,
+    manual: true,
+  };
+}
+
+function renderResults() {
+  refs.results.innerHTML = "";
+
+  if (!state.stickers.length) {
+    refs.results.classList.add("empty");
+    refs.results.innerHTML = "<p>분리 결과가 여기 표시됩니다.</p>";
+    refs.resultCount.textContent = "0개";
+    return;
+  }
+
+  refs.results.classList.remove("empty");
+  refs.resultCount.textContent = `${state.stickers.length}개`;
+
+  state.stickers.forEach((sticker, index) => {
+    const fragment = refs.template.content.cloneNode(true);
+    const preview = fragment.querySelector(".result-preview");
+    const label = fragment.querySelector(".result-label");
+    const eraseButton = fragment.querySelector(".erase-btn");
+    const deleteButton = fragment.querySelector(".delete-sticker-btn");
+    const downloadButton = fragment.querySelector(".download-btn");
+
+    sticker.canvas.classList.toggle("erase-mode", state.activeEraseIndex === index);
+    sticker.canvas.onpointerdown = (event) => handleStickerErasePointerDown(event, index);
+    sticker.canvas.onpointermove = (event) => handleStickerErasePointerMove(event, index);
+    sticker.canvas.onpointerup = (event) => handleStickerErasePointerUp(event, index);
+    sticker.canvas.onpointerleave = (event) => handleStickerErasePointerLeave(event, index);
+
+    preview.appendChild(sticker.canvas);
+    label.textContent = `스티커 ${index + 1}`;
+    eraseButton.textContent = state.activeEraseIndex === index ? "브러시 종료" : "브러시 지우기";
+    eraseButton.classList.toggle("erase-active", state.activeEraseIndex === index);
+    eraseButton.addEventListener("click", () => toggleEraseMode(index));
+    deleteButton.addEventListener("click", () => deleteStickerByIndex(index));
+    downloadButton.addEventListener("click", () => {
+      downloadCanvas(sticker.canvas, `${state.imageName}-sticker-${String(index + 1).padStart(2, "0")}.png`);
+    });
+
+    refs.results.appendChild(fragment);
+  });
+}
+
+function toggleEraseMode(index) {
+  state.activeEraseIndex = state.activeEraseIndex === index ? -1 : index;
+  state.eraseStroke = null;
+  renderResults();
+
+  if (state.activeEraseIndex === index) {
+    setStatus(`${index + 1}번 스티커에서 브러시 지우기 모드가 켜졌습니다. 드래그해서 지워 보세요.`);
+  }
+}
+
+function handleStickerErasePointerDown(event, index) {
+  if (state.activeEraseIndex !== index) {
+    return;
+  }
+
+  const point = getStickerCanvasPoint(state.stickers[index].canvas, event);
+  if (!point) {
     return;
   }
 
   pushUndoState();
-  const removedIndex = state.selectedComponentIndex;
-  state.detectedComponents.splice(removedIndex, 1);
-  state.stickers.splice(removedIndex, 1);
+  state.hasManualEdits = true;
+  state.eraseStroke = {
+    index,
+    pointerId: event.pointerId,
+    radius: getEraseRadius(state.stickers[index].canvas),
+  };
 
-  if (!state.detectedComponents.length) {
-    clearResults(false);
-    setStatus("선택한 박스를 삭제했습니다. 남은 스티커가 없습니다.");
+  state.stickers[index].canvas.setPointerCapture(event.pointerId);
+  eraseOnStickerCanvas(state.stickers[index].canvas, point, state.eraseStroke.radius);
+  event.preventDefault();
+}
+
+function handleStickerErasePointerMove(event, index) {
+  if (!state.eraseStroke || state.eraseStroke.index !== index || state.eraseStroke.pointerId !== event.pointerId) {
     return;
   }
 
-  state.selectedComponentIndex = Math.min(removedIndex, state.detectedComponents.length - 1);
-  state.dragState = null;
-  refs.resultCount.textContent = `${state.stickers.length}개`;
-  renderResults();
-  drawComponentOverlay(state.detectedComponents);
-  syncManualUi();
-  setStatus(`${removedIndex + 1}번 박스를 삭제했습니다.`);
+  const point = getStickerCanvasPoint(state.stickers[index].canvas, event);
+  if (!point) {
+    return;
+  }
+
+  eraseOnStickerCanvas(state.stickers[index].canvas, point, state.eraseStroke.radius);
+  event.preventDefault();
 }
 
-function cloneComponent(component) {
+function handleStickerErasePointerUp(event, index) {
+  if (!state.eraseStroke || state.eraseStroke.index !== index || state.eraseStroke.pointerId !== event.pointerId) {
+    return;
+  }
+
+  if (state.stickers[index].canvas.hasPointerCapture(event.pointerId)) {
+    state.stickers[index].canvas.releasePointerCapture(event.pointerId);
+  }
+
+  state.eraseStroke = null;
+  setStatus(`${index + 1}번 스티커에서 일부를 지웠습니다. 되돌리기로 복원할 수 있습니다.`);
+}
+
+function handleStickerErasePointerLeave(event, index) {
+  if (!state.eraseStroke || state.eraseStroke.index !== index || state.eraseStroke.pointerId !== event.pointerId) {
+    return;
+  }
+
+  handleStickerErasePointerUp(event, index);
+}
+
+function deleteStickerByIndex(index) {
+  if (index < 0 || index >= state.stickers.length) {
+    return;
+  }
+
+  pushUndoState();
+  state.hasManualEdits = true;
+  state.stickers.splice(index, 1);
+  state.boxes.splice(index, 1);
+
+  if (!state.stickers.length) {
+    clearResults(false);
+    setStatus("스티커를 삭제했습니다. 남은 스티커가 없습니다.");
+    return;
+  }
+
+  if (state.selectedBoxIndex === index) {
+    state.selectedBoxIndex = -1;
+  } else if (state.selectedBoxIndex > index) {
+    state.selectedBoxIndex -= 1;
+  }
+
+  if (state.activeEraseIndex === index) {
+    state.activeEraseIndex = -1;
+  } else if (state.activeEraseIndex > index) {
+    state.activeEraseIndex -= 1;
+  }
+
+  state.boxDragState = null;
+  state.panDragState = null;
+  state.eraseStroke = null;
+
+  renderResults();
+  drawBoxesOverlay();
+  syncManualUi();
+  refs.downloadAllBtn.disabled = !state.stickers.length;
+  refs.resultCount.textContent = `${state.stickers.length}개`;
+  setStatus(`${index + 1}번 스티커를 삭제했습니다.`);
+}
+
+function clearResults(resetUndo = true) {
+  state.boxes = [];
+  state.stickers = [];
+  state.selectedBoxIndex = -1;
+  state.addMode = false;
+  state.addDraftRect = null;
+  state.boxDragState = null;
+  state.panDragState = null;
+  state.activeEraseIndex = -1;
+  state.eraseStroke = null;
+  state.hasManualEdits = false;
+
+  if (resetUndo) {
+    state.undoStack = [];
+  }
+
+  refs.results.innerHTML = "<p>분리 결과가 여기 표시됩니다.</p>";
+  refs.results.classList.add("empty");
+  refs.resultCount.textContent = "0개";
+  refs.downloadAllBtn.disabled = true;
+  overlayCtx.clearRect(0, 0, refs.overlayCanvas.width, refs.overlayCanvas.height);
+  syncManualUi();
+}
+
+async function saveAllStickers() {
+  if (state.boxes.length) {
+    rebuildStickersFromBoxes();
+    renderResults();
+  }
+
+  const filenames = state.stickers.map((_, index) => `${state.imageName}-sticker-${String(index + 1).padStart(2, "0")}.png`);
+  refs.downloadAllBtn.disabled = true;
+
+  try {
+    if (canPickDirectory()) {
+      setStatus("저장할 폴더를 선택해 주세요.");
+      const directoryHandle = await window.showDirectoryPicker({ mode: "readwrite" });
+      await saveStickersToDirectory(directoryHandle, filenames);
+      setStatus(`${state.stickers.length}개의 스티커를 선택한 폴더에 저장했습니다.`);
+      return;
+    }
+
+    downloadAllStickers(filenames);
+    setStatus("브라우저 제한으로 폴더 선택은 사용할 수 없어 개별 다운로드로 저장했습니다.");
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      setStatus("폴더 선택이 취소되었습니다.");
+      return;
+    }
+
+    console.error(error);
+    downloadAllStickers(filenames);
+    setStatus("폴더 저장이 지원되지 않아 개별 다운로드로 저장했습니다.");
+  } finally {
+    refs.downloadAllBtn.disabled = !state.stickers.length;
+  }
+}
+
+function canPickDirectory() {
+  return typeof window.showDirectoryPicker === "function";
+}
+
+async function saveStickersToDirectory(directoryHandle, filenames) {
+  for (const [index, sticker] of state.stickers.entries()) {
+    const fileHandle = await directoryHandle.getFileHandle(filenames[index], { create: true });
+    const writable = await fileHandle.createWritable();
+    const blob = await canvasToBlob(sticker.canvas);
+    await writable.write(blob);
+    await writable.close();
+  }
+}
+
+function downloadAllStickers(filenames) {
+  state.stickers.forEach((sticker, index) => {
+    setTimeout(() => {
+      downloadCanvas(sticker.canvas, filenames[index]);
+    }, index * 180);
+  });
+}
+
+function getStickerCanvasPoint(canvas, event) {
+  const rect = canvas.getBoundingClientRect();
+  if (!rect.width || !rect.height) {
+    return null;
+  }
+
   return {
-    ...component,
-    pixels: Array.isArray(component.pixels) ? [...component.pixels] : [],
+    x: clamp((event.clientX - rect.left) * (canvas.width / rect.width), 0, canvas.width),
+    y: clamp((event.clientY - rect.top) * (canvas.height / rect.height), 0, canvas.height),
+  };
+}
+
+function getEraseRadius(canvas) {
+  return Math.max(10, Math.round(Math.min(canvas.width, canvas.height) * 0.06));
+}
+
+function eraseOnStickerCanvas(canvas, point, radius) {
+  const ctx = canvas.getContext("2d");
+  ctx.save();
+  ctx.globalCompositeOperation = "destination-out";
+  ctx.beginPath();
+  ctx.arc(point.x, point.y, radius, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
+
+function pushCanvasImageData(ctx, canvas) {
+  return ctx.getImageData(0, 0, canvas.width, canvas.height);
+}
+
+function cloneBox(box) {
+  return {
+    ...box,
+    pixels: Array.isArray(box.pixels) ? [...box.pixels] : [],
   };
 }
 
@@ -1049,6 +1355,38 @@ async function deserializeSticker(serializedSticker) {
   };
 }
 
+function stripExtension(filename) {
+  return filename.replace(/\.[^.]+$/, "");
+}
+
+function canvasToBlob(canvas) {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob((blob) => {
+      if (!blob) {
+        reject(new Error("Failed to create blob from canvas"));
+        return;
+      }
+      resolve(blob);
+    }, "image/png");
+  });
+}
+
+function loadImage(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const image = new Image();
+    image.onload = () => {
+      URL.revokeObjectURL(url);
+      resolve(image);
+    };
+    image.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error("Failed to load image"));
+    };
+    image.src = url;
+  });
+}
+
 function loadImageFromUrl(url) {
   return new Promise((resolve, reject) => {
     const image = new Image();
@@ -1056,6 +1394,10 @@ function loadImageFromUrl(url) {
     image.onerror = () => reject(new Error("Failed to restore image"));
     image.src = url;
   });
+}
+
+function roundZoom(value) {
+  return Math.round(value * 10) / 10;
 }
 
 function estimateBackgroundColor(data, width, height) {
@@ -1192,7 +1534,7 @@ function findConnectedComponents(mask, width, height, minArea) {
     }
 
     if (pixels.length >= minArea) {
-      components.push({ pixels, minX, minY, maxX, maxY, area: pixels.length });
+      components.push({ pixels, minX, minY, maxX, maxY, area: pixels.length, manual: false });
     }
   }
 
@@ -1606,4 +1948,9 @@ function downloadCanvas(canvas, filename) {
   link.href = canvas.toDataURL("image/png");
   link.download = filename;
   link.click();
+}
+
+function setStatus(message, isError = false) {
+  refs.status.textContent = message;
+  refs.status.style.color = isError ? "#9c4133" : "";
 }

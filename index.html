@@ -28,7 +28,7 @@
           </label>
           <div class="quick-actions">
             <button id="process-btn" class="button primary" type="button">
-              스티커 분리하기
+              스티커 다시 분리하기
             </button>
             <button id="download-all-btn" class="button secondary" type="button" disabled>
               전체 저장
@@ -73,7 +73,7 @@
             </div>
             <div class="control checkbox">
               <label for="auto-preview">
-                <input id="auto-preview" type="checkbox" checked />
+                <input id="auto-preview" type="checkbox" />
                 옵션 변경 시 자동으로 다시 분리
               </label>
             </div>
@@ -122,10 +122,23 @@
               <h2>원본 미리보기</h2>
               <span id="image-meta" class="meta">이미지 없음</span>
             </div>
+            <div class="preview-toolbar">
+              <div class="zoom-controls">
+                <button id="add-box-btn" class="button secondary zoom-btn" type="button">오브젝트 추가</button>
+                <button id="zoom-out-btn" class="button tertiary zoom-btn" type="button">-</button>
+                <input id="zoom-range" type="range" min="1" max="5" step="0.1" value="1" />
+                <button id="zoom-in-btn" class="button tertiary zoom-btn" type="button">+</button>
+                <button id="zoom-reset-btn" class="button tertiary zoom-btn" type="button">100%</button>
+              </div>
+              <span id="zoom-value" class="meta">100%</span>
+            </div>
             <div class="canvas-frame">
-              <div class="canvas-stack">
-                <canvas id="source-canvas"></canvas>
-                <canvas id="overlay-canvas"></canvas>
+              <div id="canvas-viewport" class="canvas-viewport">
+                <div id="canvas-stack" class="canvas-stack">
+                  <canvas id="source-canvas"></canvas>
+                  <canvas id="overlay-canvas"></canvas>
+                </div>
+                <p id="add-box-hint" class="canvas-hint" hidden>드래그해서 새 오브젝트 영역을 지정하세요</p>
               </div>
             </div>
           </div>

@@ -257,7 +257,6 @@ h1 {
 }
 
 .canvas-frame {
-  min-height: 420px;
   padding: 16px;
   border-radius: 24px;
   border: 1px solid var(--line);
@@ -267,29 +266,81 @@ h1 {
     linear-gradient(45deg, transparent 75%, rgba(188, 163, 144, 0.08) 75%) 10px -10px / 20px 20px,
     linear-gradient(-45deg, transparent 75%, rgba(188, 163, 144, 0.08) 75%) -10px 0 / 20px 20px,
     #fff;
-  display: grid;
-  place-items: center;
+}
+
+.preview-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 14px;
+}
+
+.zoom-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  flex: 1;
+}
+
+.zoom-controls input[type="range"] {
+  min-width: 120px;
+  flex: 1;
+  accent-color: var(--accent-strong);
+}
+
+.zoom-btn {
+  padding: 10px 14px;
+}
+
+.mode-active {
+  color: #fff;
+  border-color: transparent;
+  background: linear-gradient(135deg, #b7866f, #8e5e47);
+}
+
+.canvas-viewport {
+  position: relative;
+  width: 100%;
+  height: min(70vh, 820px);
+  min-height: 420px;
+  overflow: hidden;
+  border-radius: 18px;
+}
+
+.canvas-hint {
+  position: absolute;
+  left: 18px;
+  top: 18px;
+  z-index: 4;
+  margin: 0;
+  padding: 10px 14px;
+  border-radius: 999px;
+  color: #fffaf5;
+  background: rgba(118, 72, 46, 0.92);
+  font-size: 0.92rem;
+  pointer-events: none;
 }
 
 .canvas-stack {
-  position: relative;
-  display: inline-grid;
-  place-items: center;
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform-origin: center center;
 }
 
 #source-canvas,
 #overlay-canvas {
-  max-width: 100%;
-  max-height: 70vh;
+  position: absolute;
+  inset: 0;
   border-radius: 18px;
   display: block;
 }
 
 #overlay-canvas {
-  position: absolute;
-  inset: 0;
   pointer-events: auto;
-  cursor: pointer;
+  cursor: grab;
 }
 
 .manual-panel {
@@ -396,8 +447,17 @@ h1 {
   }
 
   .canvas-frame {
-    min-height: 260px;
     padding: 12px;
+  }
+
+  .canvas-viewport {
+    min-height: 260px;
+    height: min(62vh, 540px);
+  }
+
+  .preview-toolbar {
+    flex-direction: column;
+    align-items: stretch;
   }
 
   .results {
